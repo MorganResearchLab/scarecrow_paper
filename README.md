@@ -93,6 +93,10 @@ plot_pct_genes <- function(mat, tr2g, top_n = 20, symbol = "ensembl", fontsize=1
     coord_flip() +
     theme_bw() + theme(text = element_text(size=fontsize))
 }
+
+# Contants
+fontsize <- 8
+setwd("~/Documents/scarecrow/results")
 ```
 
 ## Import transcript to gene table
@@ -111,18 +115,14 @@ for(n in gene_name_dups) {
 }
 ```
 
-## Import kallisto counts matrices
+### Import kallisto counts matrices
 
-After generating count matrices for each dataset with `kallisto` under different `scarecrow` jitter settings, the `counts_unfiltered/cells*` files from each run are read into a list and named. In the below example the Parse data is imported for count matrices generated at jitter 0, 1, and 2.
+After generating count matrices for each dataset with `kallisto` under different `scarecrow` jitter settings, the `counts_unfiltered/cells*` are read into a list and named.
 
 ```R
-setwd("~/Documents/scarecrow/results")
-data <- list.files(path = "~/Documents/scarecrow/results", recursive = T, pattern = "cells_x_genes.mtx")
-
-# Parse WTv2 data
-raw <- list(read_count_output(dirname(data[grep("Parse-WTv2/J0", data)]), name = "cells_x_genes"),
-            read_count_output(dirname(data[grep("Parse-WTv2/J1", data)]), name = "cells_x_genes"),
-            read_count_output(dirname(data[grep("Parse-WTv2/J2", data)]), name = "cells_x_genes"))
+raw <- list(read_count_output("~/Documents/scarecrow/results/Parse-WTv2/J0/kallisto/counts_unfiltered"), name = "cells_x_genes"),
+            read_count_output("~/Documents/scarecrow/results/Parse-WTv2/J1/kallisto/counts_unfiltered"), name = "cells_x_genes"),
+            read_count_output("~/Documents/scarecrow/results/Parse-WTv2/J2/kallisto/counts_unfiltered"), name = "cells_x_genes"))
 names(raw) <- c("Parse-WTv2-J0", "Parse-WTv2-J1", "Parse-WTv2-J2")
 ```
 
@@ -224,7 +224,7 @@ mats_filtered <- lapply(mats, function(dat) {
 })
 ```
 
-## Plot
+### Plotting the processing results
 
 We generate multi-panel plots to illustrate some of the results from the above steps as follows.
 
@@ -313,3 +313,59 @@ ggarrange(p1,p2, labels=c("A", "B"), nrow=2, common.legend = T, legend = "right"
 This returns the following image:
 
 <img src="./img/Parse-WTv2-J0-Parse-WTv2-J2_counts.png" alt="Parse jitter 0 versus jitter 2 gene counts"/>
+
+
+## Barcode count gains
+
+The `combined_CB_counts.txt` file output by `scarecrow stats` can be analysed to plot barcode count gains under different jitter settings. In the below example we import the Parse jitter 0 and jitter 2 data.
+
+```R
+library(mgcv)
+
+file_a <- read.table("~/Documents/scarecrow_test/results/Parse-WTv2/J0/SRR28867558_1_trimmed.fastq.combined_CB_counts.txt")
+file_b <- read.table("~/Documents/scarecrow_test/results/Parse-WTv2/J2/SRR28867558_1_trimmed.fastq.combined_CB_counts.txt")
+
+dataset <- "Parse"
+jitter <- c(0,2) # set labels for jitter values of data
+
+dat <- merge(file_a, file_b, by="V1", all=T)
+dat[is.na(dat)] <- 0
+dat$diff <- dat$V2.y-dat$V2.x
+dat$set <- "Intersect"
+dat[which(dat$V2.y == 0),]$set <- paste0("J", jitter[1])
+dat[which(dat$V2.x == 0),]$set <- paste0("J", jitter[2])
+dat$set <- factor(dat$set, levels=c(paste0("J", jitter[1]), "Intersect", paste0("J", jitter[2])))
+
+p1 <- ggplot(dat[which(dat$set==paste0("J", jitter[1])),], aes(x=log10(V2.x), y=diff)) +
+  geom_line(colour="red", lty=2, alpha=0.8) + geom_point(size=1, alpha=0.5) +
+  xlab(paste("Jitter", jitter[1], "UMIs (log10)")) + ylab("Δ UMI") +
+  scale_x_continuous(labels = label_comma()) + scale_y_continuous(labels = label_comma()) +
+  theme_bw() + theme(text = element_text(size=fontsize), legend.position = "bottom")
+
+# BAM (big additive model)
+fit <- bam(diff ~ V2.x + s(V2.x, bs = "tp"), data = dat[which(dat$set=="Intersect"),])
+p2 <- ggplot(dat[which(dat$set=="Intersect"),], aes(x=log10(V2.x), y=diff)) +
+  geom_line(colour="red", lty=2, alpha=0.8) + geom_point(size=1, alpha=0.5) +
+  geom_smooth(method = "bam", formula = y ~ x + s(x, bs="tp"), color = "blue") +
+  xlab(paste("Jitter", jitter[1], "UMIs (log10)")) + ylab("Δ UMI") +
+  annotate("text", x = -Inf, y = max(dat[which(dat$set=="Intersect"),]$diff),
+           label = sprintf("\tSlope: %.3f\n\tIntercept: %.3f", coef(fit)["V2.x"], coef(fit)["(Intercept)"]),
+           hjust = 0, vjust = 1, size = 3) +
+  scale_x_continuous(labels = label_comma()) + scale_y_continuous(labels = label_comma()) +
+  theme_bw() + theme(text = element_text(size=fontsize), legend.position = "bottom")
+
+p3 <- ggplot(dat[which(dat$set==paste0("J", jitter[2])),], aes(x=log10(V2.y), y=diff)) +
+  geom_line(colour="red", lty=2, alpha=0.8) + geom_point(size=1, alpha=0.5) +
+  xlab(paste("Jitter", jitter[2], "UMIs (log10)")) + ylab("Δ UMI") +
+  scale_x_continuous(labels = label_comma()) + scale_y_continuous(labels = label_comma()) +
+  theme_bw() + theme(text = element_text(size=fontsize), legend.position = "bottom")
+
+ggarrange(p1,p2,p3, nrow=1, common.legend=F, widths=c(1,3,1)) %>%
+  ggsave(width = 12, height = 6, units="in", dpi=300, filename = paste0("plots/", dataset, "_", jitter[1], "-", jitter[2], "_UMIs.png"))
+```
+
+This results in the following plot:
+
+<img src="./img/Parse_0-2_UMIs.png" alt="Parse jitter 0 versus jitter 2 barcode gains"/>
+
+The plots show log10 UMI counts on the x axis and the difference in UMI count (jitter 2 - jitter 1) for the same barcode on the y axis. The left panel shows barcodes identified only at jitter 0, the middle panel shows barcodes identified in both datasets, and the right panel shows barcodes identified only at jitter 2. The negative difference in UMI counts in the intersect implies the re-assignment of reads to different barcodes at jitter 2 relative to jitter 0.
