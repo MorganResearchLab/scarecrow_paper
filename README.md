@@ -375,9 +375,6 @@ The plots show log10 UMI counts on the x axis and the difference in UMI count (j
 
 Starting, for example, from the Parse raw data for jitter 0 and 2, we apply basic filtering to retain cells and features with at least 100 counts each. We then subset the two matrices to retain cells with shared barcodes between both sets of data.
 
-raw <- list(read_count_output("./kallisto/J0M2/SRR28867558_1_trimmed/counts_unfiltered", name = "cells_x_genes"),
-            read_count_output("./kallisto/J2M2/SRR28867558_1_trimmed/counts_unfiltered", name = "cells_x_genes"))
-
 ```R
 raw <- list(read_count_output("~/Documents/scarecrow/results/Parse-WTv2/J0/kallisto/counts_unfiltered", name = "cells_x_genes"),
             read_count_output("~/Documents/scarecrow/results/Parse-WTv2/J2/kallisto/counts_unfiltered", name = "cells_x_genes"))
