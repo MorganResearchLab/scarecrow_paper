@@ -120,9 +120,9 @@ for(n in gene_name_dups) {
 After generating count matrices for each dataset with `kallisto` under different `scarecrow` jitter settings, the `counts_unfiltered/cells*` are read into a list and named.
 
 ```R
-raw <- list(read_count_output("~/Documents/scarecrow/results/Parse-WTv2/J0/kallisto/counts_unfiltered"), name = "cells_x_genes"),
-            read_count_output("~/Documents/scarecrow/results/Parse-WTv2/J1/kallisto/counts_unfiltered"), name = "cells_x_genes"),
-            read_count_output("~/Documents/scarecrow/results/Parse-WTv2/J2/kallisto/counts_unfiltered"), name = "cells_x_genes"))
+raw <- list(read_count_output("~/Documents/scarecrow/results/Parse-WTv2/J0/kallisto/counts_unfiltered", name = "cells_x_genes"),
+            read_count_output("~/Documents/scarecrow/results/Parse-WTv2/J1/kallisto/counts_unfiltered", name = "cells_x_genes"),
+            read_count_output("~/Documents/scarecrow/results/Parse-WTv2/J2/kallisto/counts_unfiltered", name = "cells_x_genes"))
 names(raw) <- c("Parse-WTv2-J0", "Parse-WTv2-J1", "Parse-WTv2-J2")
 ```
 
@@ -240,6 +240,8 @@ for(i in 1:length(raw)){
 Below is an example, showing the plot generated from the Parse data at jitter 2.
 
 <img src="./img/Parse-WTv2-J2_kallisto.png" alt="Parse jitter 2 processing results"/>
+
+Panel A shows a library saturation plot, with points coloured according to the density of neighbouring points. Note that there is a high density of points with a single feature and molecule, these correspond to near empty droplets. Panel B shows a knee plot, indicating the inflection point for cells that have at least 100 UMIs, the total number of which is indicated on the plot. Panel C shows raindcloud plots to illustrate the distributions of the number of features per cell, the number of molecules per cell, and the percentage of mitochondrial (mt) genes per cell. These distributions are calcualted after filtering to retain cells with UMI counts exceeding the inflection point. Panel D presents a density scatter plot of UMI count against mt gene content for features, with the 99th percentile of mt gene content indicated with a dashed line.
 
 Next we compare the mean and median counts per gene between two sets of results. In the below code we compare the first list element to the last, which for the Parse data results is comparing jitter 0 to jitter 2.
 
@@ -369,3 +371,130 @@ This results in the following plot:
 <img src="./img/Parse_0-2_UMIs.png" alt="Parse jitter 0 versus jitter 2 barcode gains"/>
 
 The plots show log10 UMI counts on the x axis and the difference in UMI count (jitter 2 - jitter 1) for the same barcode on the y axis. The left panel shows barcodes identified only at jitter 0, the middle panel shows barcodes identified in both datasets, and the right panel shows barcodes identified only at jitter 2. The negative difference in UMI counts in the intersect implies the re-assignment of reads to different barcodes at jitter 2 relative to jitter 0.
+
+
+## k-Nearest neighbours
+
+Starting, for example, from the Parse raw data for jitter 0 and 2, we apply basic filtering to retain cells and features with at least 100 counts each. We then subset the two matrices to retain cells with shared barcodes between both sets of data.
+
+raw <- list(read_count_output("./kallisto/J0M2/SRR28867558_1_trimmed/counts_unfiltered", name = "cells_x_genes"),
+            read_count_output("./kallisto/J2M2/SRR28867558_1_trimmed/counts_unfiltered", name = "cells_x_genes"))
+
+```R
+raw <- list(read_count_output("~/Documents/scarecrow/results/Parse-WTv2/J0/kallisto/counts_unfiltered", name = "cells_x_genes"),
+            read_count_output("~/Documents/scarecrow/results/Parse-WTv2/J2/kallisto/counts_unfiltered", name = "cells_x_genes"))
+names(raw) <- c("Parse-WTv2-J0", "Parse-WTv2-J2")
+
+mats <- lapply(1:length(raw), function(i) {
+  res_mat <- raw[[i]][, colSums(raw[[i]]) > 99]
+  res_mat <- res_mat[Matrix::rowSums(res_mat) > 99,]
+})
+
+barcodes <- colnames(mats[[1]])[colnames(mats[[1]]) %in% colnames(mats[[2]])]
+genes <- rownames(mats[[1]])[rownames(mats[[1]]) %in% rownames(mats[[2]])]
+mats[[1]] <- mats[[1]][genes, barcodes]
+mats[[2]] <- mats[[2]][genes, barcodes]
+```
+
+We use the `FNN` library's `get.knn` function to identify the nearest neighbours for a range of *k* values (2:10, 20, 30, 50) for each matrix.
+
+```R
+knn_results <- lapply(c(2:10,20,30,50), function(k) lapply(mats, function(m) FNN::get.knn(as.matrix(t(m)), k = k)) )
+```
+
+This can take a while, so you may wish to save the object afterward so that it can just reloaded in the future without having to re-run the analysis.
+
+```R
+save(knn_results, file="Parse_knn_results.RData")
+load("Parse_knn_results.RData")
+```
+
+After calculating kNN for each matrix, we can calculate the proportion of shared and identical neighbours identified across both datasets for each cell.
+
+```R
+knn_props <- lapply(1:length(knn_results), function(k) {
+  knn_shared <- do.call("rbind", lapply(1:nrow(knn_results[[k]][[1]]$nn.index), function(i) {
+      sum(knn_results[[k]][[1]]$nn.index[i,] %in% knn_results[[k]][[2]]$nn.index[i,])
+    } ))
+  knn_identical <- do.call("rbind", lapply(1:nrow(knn_results[[k]][[1]]$nn.index), function(i) {
+      sum(knn_results[[k]][[1]]$nn.index[i,] == knn_results[[k]][[2]]$nn.index[i,])
+    } ))
+  return(data.frame(k = dim(knn_results[[k]][[1]]$nn.index)[2],
+                    shared = knn_shared/dim(knn_results[[k]][[1]]$nn.index)[2],
+                    identical = knn_identical/dim(knn_results[[k]][[1]]$nn.index)[2]))
+})
+knn_props <- do.call("rbind", knn_props)
+```
+
+Next we collapse the data into a format that can be more easily plotted with ggplot. We add a small amount of noise to the k value so that the points do not stack in thin vertical lines. We also allocate separate facets for values at k > 10, to avoid large gaps on the x axis or using a discontinuous scale.
+
+```R
+knn_props_long <- rbind(
+  data.frame(k = knn_props$k, value = knn_props$shared, group = "shared"),
+  data.frame(k = knn_props$k, value = knn_props$identical, group = "identical")
+)
+
+set.seed(123)
+knn_props_long$x <- knn_props_long$k + runif(nrow(knn_props_long), -0.00000001, 0.00000001)
+knn_props_long$facet <- 1
+knn_props_long[which(knn_props_long$k>10),]$facet <- knn_props_long[which(knn_props_long$k>10),]$k
+```
+
+Using this data we generate a list of high density region (HDR) plots for each facet. After which, we move the y axis text, ticks, and labels from all but the first plot.
+
+```R
+plots <- lapply(unique(knn_props_long$facet), function(f) {
+  ggplot(knn_props_long[which(knn_props_long$group=="shared" & knn_props_long$facet == f),], aes(x = x, y = value)) +
+    geom_hdr(aes(fill=after_stat(probs)), alpha=1) +
+    scale_x_continuous(breaks = seq(1:50)) + ylim(0,1) +
+    ylab("Proportion shared") + xlab("k Nearest-Neighbours") +
+    theme_bw() + theme(text = element_text(size = fontsize), legend.position = "top",
+                       plot.margin = margin(l = 0.75, r = 0, unit = "cm"),
+                       axis.text.x = element_text(size=6),
+                       axis.text.y = element_text(size=6))
+})
+
+plots[-1] <- lapply(plots[-1], function(p) {
+  p + xlab("") + theme(axis.title.y = element_blank(), axis.text.y = element_blank(),
+            axis.ticks.y = element_blank(),
+            plot.margin = margin(l = 0, r = 0, unit = "cm"))
+})
+```
+
+Next, we generate quantile bar plots for each k value. Note, this is a single plot faceted by k value.
+
+```R
+qdat <- knn_props %>% group_by(k) %>%
+  summarise(
+    q25 = quantile(shared, 0.25),
+    q50 = quantile(shared, 0.5),  # median
+    q75 = quantile(shared, 0.75),
+    q100 = quantile(shared, 1.00)
+  ) %>%
+  pivot_longer(
+    cols = starts_with("q"),         # or just: -group
+    names_to = "quantile",
+    values_to = "value"
+  )
+qdat$quantile <- as.numeric(gsub("q", "", qdat$quantile))
+p2 <- ggplot(qdat, aes(x=quantile, y=value, fill="a")) + geom_col(position="dodge") + facet_grid(.~k) +
+  scale_fill_jco() + scale_x_continuous(breaks=c(0,25,50,75,100)) +
+  ylab("Proportion of cells") + xlab("Quantile of proportion shared") +
+  theme_bw() + theme(text = element_text(size = fontsize),
+                     axis.text.x = element_text(angle=90, hjust=1, vjust=0.5, size=6),
+                     axis.text.y = element_text(size=6),
+                     legend.position="none")
+```
+
+Finally, the HDR and bar plots are output as a multi-panel figure.
+
+```R
+ggarrange(ggarrange(plotlist=plots, nrow=1, widths=c(1.5,0.1,0.1,0.1), common.legend=T),
+          p2, nrow=2, heights = c(2,1)) %>%
+  ggsave(width = 5, height = 4, units="in", dpi=300, bg = "white",
+         filename = paste0("plots/", names(raw)[1], "-", names(raw)[length(raw)], "_kNN.png"))
+```
+
+Resulting in the following figure:
+
+<img src="./img/Parse_0-2_kNN.png" alt="Parse jitter 0 versus jitter 2 nearest-neighbours"/>
