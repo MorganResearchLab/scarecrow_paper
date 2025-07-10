@@ -266,7 +266,6 @@ rowstats_dgCMatrix <- function(dgCMatrix) {
   min_count <- rep(NA_real_, nrow(dgCMatrix))
   max_count <- rep(NA_real_, nrow(dgCMatrix))
 
-  # If we have any valid values...
   if (nrow(valid_values) > 0) {
     # Split values by row index
     values_by_row <- split(valid_values$x, valid_values$i)
@@ -289,7 +288,6 @@ a <- rowstats_dgCMatrix(mats_filtered[[1]]@assays$RNA$counts)
 b <- rowstats_dgCMatrix(mats_filtered[[length(mats_filtered)]]@assays$RNA$counts)
 tmp <- merge(a, b, by="gene")
 
-# kallisto
 p1 <- ggplot(tmp, aes(x=log(mean.x), y=log(mean.y))) + geom_pointdensity(size=1, adjust=0.5) +
   scale_color_viridis(name="Density\n(neighbours)", labels = label_comma()) +
   xlab("Jitter 0 mean count per gene (log10)") + ylab(paste0("Jitter ", length(raw)-1, " mean count per gene (log10)")) +
@@ -467,12 +465,12 @@ Next, we generate quantile bar plots for each k value. Note, this is a single pl
 qdat <- knn_props %>% group_by(k) %>%
   summarise(
     q25 = quantile(shared, 0.25),
-    q50 = quantile(shared, 0.5),  # median
+    q50 = quantile(shared, 0.5),
     q75 = quantile(shared, 0.75),
     q100 = quantile(shared, 1.00)
   ) %>%
   pivot_longer(
-    cols = starts_with("q"),         # or just: -group
+    cols = starts_with("q"),
     names_to = "quantile",
     values_to = "value"
   )
@@ -495,6 +493,6 @@ ggarrange(ggarrange(plotlist=plots, nrow=1, widths=c(1.5,0.1,0.1,0.1), common.le
          filename = paste0("plots/", names(raw)[1], "-", names(raw)[length(raw)], "_kNN.png"))
 ```
 
-Resulting in the following figure:
+Resulting in the following:
 
 <img src="./img/Parse_0-2_kNN.png" alt="Parse jitter 0 versus jitter 2 nearest-neighbours"/>
