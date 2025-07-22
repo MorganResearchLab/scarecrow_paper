@@ -625,13 +625,35 @@ p2 <- DimPlot(mats_clustering[[2]], reduction = "umap") + scale_color_jco()
 ggarrange(p1, p2, labels=c("A", "B")) %>%
   ggsave(width = 12, height = 6, units="in", dpi=300, bg = "white",
          filename = paste0("plots/", names(raw)[1], "-", names(raw)[length(raw)], "_umap.png"))
-
-# Calculated adjusted Rand index
-adjustedRandIndex(factor(mats_clustering[[2]]@meta.data$seurat_clusters),
-  factor(mats_clustering[[1]]@meta.data$seurat_clusters))
 ```
-
 
 The Parse UMAP figure should resemble the following:
 
 <img src="./img/Parse-WTv2-J0-Parse-WTv2-J2_umap.png" alt="Parse jitter 0 versus jitter 2 UMAP"/>
+
+
+We compare cluster membership by computing the adjusted Rand index between the jitter 0 and jitter 2 clusters. In addition, we can generate a heat map of cluster assignments as follows:
+
+```R
+# Calculated adjusted Rand index
+adjRand <- adjustedRandIndex(factor(mats_clustering[[2]]@meta.data$seurat_clusters),
+  factor(mats_clustering[[1]]@meta.data$seurat_clusters))
+
+# Generate cluster table for plotting heatmap
+clusters <- as.data.frame(table(Jitter0 = mats_clustering[[1]]@meta.data$seurat_clusters,
+                                Jitter1 = mats_clustering[[2]]@meta.data$seurat_clusters))
+# Normalize
+clusters <- clusters %>% group_by(Jitter0) %>% mutate(Prop = Freq / sum(Freq)) %>% ungroup()
+
+# Plot heatmap
+ggplot(clusters, aes(x = Jitter1, y = Jitter0, fill = Prop)) +
+    geom_tile(color = "white") +
+    scale_fill_gradient(low = "#DDDDFF", high = "steelblue")+
+    geom_text(aes(label = Freq), size = 2) +  # show actual counts
+    labs(x = "Jitter 2 cluster assignments", y = "Jitter 0 cluster assignments", fill = "Proportion") +
+    theme_bw() + theme(text = element_text(size=8))
+```
+
+Which returns the following figure:
+
+<img src="./img/Parse-WTv2-J0-Parse-WTv2-J2_hmap.png" alt="Parse jitter 0 versus jitter 2 cluster membership heatmap"/>
