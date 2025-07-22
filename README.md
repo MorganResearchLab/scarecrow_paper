@@ -15,6 +15,10 @@ library(ggpointdensity)
 library(viridis)
 library(scales)
 library(ggpmisc)
+library(DoubletFinder)
+library(glmGamPoi)
+library(ggsci)
+library(mclust)
 
 # Slightly modified from BUSpaRse, just to avoid installing a few dependencies not used here
 read_count_output <- function(dir, name) {
@@ -220,7 +224,13 @@ mt_pct <- lapply(mats, function(dat) {
 mats_filtered <- lapply(mats, function(dat) {
   dat[["percent.mt"]] <- PercentageFeatureSet(dat, pattern = "^MT-")
   dat <- subset(dat, subset = percent.mt < quantile(dat$percent.mt,.99))
-  NormalizeData(dat, normalization.method = "LogNormalize", scale.factor = 10000)
+  # Remove genes with zero total counts
+  counts_mat <- GetAssayData(dat, slot = "counts")
+  nonzero_genes <- Matrix::rowSums(counts_mat) > 0
+  dat <- dat[nonzero_genes, ]
+  # Normalize the filtered object
+  dat <- NormalizeData(dat, normalization.method = "LogNormalize", scale.factor = 10000)
+  return(dat)
 })
 ```
 
@@ -246,51 +256,87 @@ Panel A shows a library saturation plot, with points coloured according to the d
 Next we compare the mean and median counts per gene between two sets of results. In the below code we compare the first list element to the last, which for the Parse data results is comparing jitter 0 to jitter 2.
 
 ```R
-# Function to calculate row-wise stats of dgCMatrix
-rowstats_dgCMatrix <- function(dgCMatrix) {
-  # Convert to triplet form (i,j,x)
+# Median genes per cell
+genes_per_cell.median <- lapply(1:length(mats_filtered), function(i) median(Matrix::colSums(mats_filtered[[i]]@assays$RNA$counts != 0)))
+
+# Calculate row-wise and col-wise stats of dgCMatrix
+sparse_stats_dgCMatrix <- function(dgCMatrix) {
+  stopifnot(inherits(dgCMatrix, "dgCMatrix"))
+
+  # Convert to triplet form (i = row, j = col, x = value)
   mat_triplet <- summary(dgCMatrix)
 
-  # Convert character '.' to NA if they exist
+  # Clean up x values
   if (is.character(mat_triplet$x)) {
     mat_triplet$x[mat_triplet$x == "."] <- NA
     mat_triplet$x <- as.numeric(mat_triplet$x)
   }
 
-  # Filter for non-zero, non-NA values
+  # Filter non-zero and non-NA entries
   valid_values <- mat_triplet[mat_triplet$x != 0 & !is.na(mat_triplet$x), ]
 
-  # Initialize result vector with NAs
-  medians <- rep(NA_real_, nrow(dgCMatrix))
-  means <- rep(NA_real_, nrow(dgCMatrix))
-  min_count <- rep(NA_real_, nrow(dgCMatrix))
-  max_count <- rep(NA_real_, nrow(dgCMatrix))
-
+  ## Row-wise stats (gene-level)
+  row_medians <- row_means <- row_min <- row_max <- rep(NA_real_, nrow(dgCMatrix))
   if (nrow(valid_values) > 0) {
-    # Split values by row index
-    values_by_row <- split(valid_values$x, valid_values$i)
-    # Calculate median for each row with valid values
-    row_medians <- vapply(values_by_row, median, numeric(1))
-    # Calculate mean for each row with valid values
-    row_means <- vapply(values_by_row, mean, numeric(1))
-    row_min <- vapply(values_by_row, min, numeric(1))
-    row_max <- vapply(values_by_row, max, numeric(1))
-    # Insert results at the correct row positions
-    medians[as.integer(names(row_medians))] <- row_medians
-    means[as.integer(names(row_means))] <- row_means
-    min_count[as.integer(names(row_min))] <- row_min
-    max_count[as.integer(names(row_max))] <- row_max
+    row_split <- split(valid_values$x, valid_values$i)
+    row_medians_partial <- vapply(row_split, median, numeric(1))
+    row_means_partial   <- vapply(row_split, mean, numeric(1))
+    row_min_partial     <- vapply(row_split, min, numeric(1))
+    row_max_partial     <- vapply(row_split, max, numeric(1))
+    row_indices <- as.integer(names(row_medians_partial))
+    row_medians[row_indices] <- row_medians_partial
+    row_means[row_indices]   <- row_means_partial
+    row_min[row_indices]     <- row_min_partial
+    row_max[row_indices]     <- row_max_partial
   }
 
-  return(data.frame(gene=rownames(dgCMatrix), mean=means, median=medians, min=min_count, max=max_count))
-}
-a <- rowstats_dgCMatrix(mats_filtered[[1]]@assays$RNA$counts)
-b <- rowstats_dgCMatrix(mats_filtered[[length(mats_filtered)]]@assays$RNA$counts)
-tmp <- merge(a, b, by="gene")
+  row_stats <- data.frame(
+    gene = rownames(dgCMatrix),
+    mean = row_means,
+    median = row_medians,
+    min = row_min,
+    max = row_max,
+    stringsAsFactors = FALSE
+  )
 
+  ## Column-wise stats (cell-level)
+  col_medians <- col_means <- col_min <- col_max <- col_total <- rep(NA_real_, ncol(dgCMatrix))
+  if (nrow(valid_values) > 0) {
+    col_split <- split(valid_values$x, valid_values$j)
+    col_medians_partial <- vapply(col_split, median, numeric(1))
+    col_means_partial   <- vapply(col_split, mean, numeric(1))
+    col_min_partial     <- vapply(col_split, min, numeric(1))
+    col_max_partial     <- vapply(col_split, max, numeric(1))
+    col_total_partial     <- vapply(col_split, sum, numeric(1))
+    col_indices <- as.integer(names(col_medians_partial))
+    col_medians[col_indices] <- col_medians_partial
+    col_means[col_indices]   <- col_means_partial
+    col_min[col_indices]     <- col_min_partial
+    col_max[col_indices]     <- col_max_partial
+    col_total[col_indices]     <- col_total_partial
+  }
+
+  col_stats <- data.frame(
+    cell = colnames(dgCMatrix),
+    mean = col_means,
+    median = col_medians,
+    min = col_min,
+    max = col_max,
+    total = col_total,
+    stringsAsFactors = FALSE
+  )
+
+  return(list(row_stats = row_stats, col_stats = col_stats))
+}
+
+# Generate matrix stats for each filtered counts matrix
+mat_stats <-  lapply(1:length(mats_filtered), function(i) sparse_stats_dgCMatrix(mats_filtered[[i]]@assays$RNA$counts))
+
+# Merge stats from two matrices for plotting
+tmp <- merge(mat_stats[[1]]$row_stats, mat_stats[[length(mat_stats)]]$row_stats, by="gene")
 p1 <- ggplot(tmp, aes(x=log(mean.x), y=log(mean.y))) + geom_pointdensity(size=1, adjust=0.5) +
   scale_color_viridis(name="Density\n(neighbours)", labels = label_comma()) +
-  xlab("Jitter 0 mean count per gene (log10)") + ylab(paste0("Jitter ", length(raw)-1, " mean count per gene (log10)")) +
+  xlab("Jitter 0 mean count per gene (log10)") + ylab(paste0("Jitter ", length(mat_stats)-1, " mean count per gene (log10)")) +
   geom_abline(colour="red", lty=2) +
   annotate("label", x = Inf, y = Inf, hjust = 1.1, vjust = 1.1, fill = "white", alpha = 0.7, size = 3,
            label = paste("Above abline:", sum(tmp$mean.y > tmp$mean.x, na.rm=T),
@@ -298,7 +344,7 @@ p1 <- ggplot(tmp, aes(x=log(mean.x), y=log(mean.y))) + geom_pointdensity(size=1,
   theme_bw() + theme(text = element_text(size=fontsize), legend.position = "right")
 p2 <- ggplot(tmp, aes(x=log(max.x), y=log(max.y))) + geom_pointdensity(size=1, adjust=0.5) +
   scale_color_viridis(name="Density\n(neighbours)", labels = label_comma()) +
-  xlab("Jitter 0 max count per gene (log10)") + ylab(paste0("Jitter ", length(raw)-1, " max count per gene (log10)")) +
+  xlab("Jitter 0 max count per gene (log10)") + ylab(paste0("Jitter ", length(mat_stats)-1, " max count per gene (log10)")) +
   geom_abline(colour="red", lty=2) +
   annotate("label", x = Inf, y = Inf, hjust = 1.1, vjust = 1.1, fill = "white", alpha = 0.7, size = 3,
            label = paste("Above abline:", sum(tmp$max.y > tmp$max.x, na.rm=T),
@@ -307,7 +353,7 @@ p2 <- ggplot(tmp, aes(x=log(max.x), y=log(max.y))) + geom_pointdensity(size=1, a
 
 ggarrange(p1,p2, labels=c("A", "B"), nrow=2, common.legend = T, legend = "right") %>%
   ggsave(width = 4, height = 6, units="in", dpi=300, bg = "white",
-         filename = paste0("plots/", names(raw)[1], "-", names(raw)[length(raw)], "_counts.png"))
+         filename = paste0("plots/", names(raw)[1], "-", names(raw)[length(mat_stats)], "_counts.png"))
 ```
 
 This returns the following image:
@@ -493,3 +539,94 @@ ggarrange(ggarrange(plotlist=plots, nrow=1, widths=c(1.5,0.1,0.1,0.1), common.le
 Resulting in the following:
 
 <img src="./img/Parse_0-2_kNN.png" alt="Parse jitter 0 versus jitter 2 nearest-neighbours"/>
+
+The mean proportion of shared neighbours for each k value can be reported as follows:
+
+```R
+# Mean proportion shared neighbours by k value
+knn_props_long %>% filter(group=="shared") %>% group_by(k) %>% summarize(mean(value))
+```
+
+## Cluster membership
+
+Example using the Parse raw data for jitter 0 and 2. We apply an initial filter to retain cells with at least 100 UMIs, and remove genes with zero counts. Next we remove cells expressing >1% mitochondrial genes and any with fewer than 500 UMIs. These steps could be reduced into one, but it is sometimes helpful to monitor the impact of different filters on the data. Following this filtering, the data is normalised by SCTransform. Next we label doublets identified by DoubletFinder assuming a 3% double rate. The returned object is now a list containing: singlets, doublets, and the data.frame returned by the find.pK function of DoubletFinder.
+
+```R
+j = 3 # For the Parse data, we have jitter = [0,1,2] in the raw list, so want to compare elements 1 and 3
+mats <- lapply(c(1,j), function(i) {
+  res_mat <- raw[[i]][, colSums(raw[[i]]) > knees[[i]]$inflection]
+  res_mat <- res_mat[Matrix::rowSums(res_mat) > 0,]
+  tmp <- rownames(res_mat)
+  rownames(res_mat) <- tr2g$gene_name[match(rownames(res_mat), tr2g$gene)]
+  rownames(res_mat)[which(is.na(rownames(res_mat)))] <- tmp[which(is.na(rownames(res_mat)))]
+  CreateSeuratObject(counts = res_mat, project = names(raw)[i], min.cells = 1, min.features = 1)
+})
+
+# Filter count matrix on mt < 99%, retain nonzero genes and cells with UMIs >= 500, return SCTransofrm normalized matrix
+mats <- lapply(mats, function(dat) {
+  dat[["percent.mt"]] <- PercentageFeatureSet(dat, pattern = "^MT-")
+  dat <- subset(dat, subset = percent.mt < quantile(dat$percent.mt,.99))
+  counts_mat <- GetAssayData(dat, slot = "counts")
+  sufficient_UMIs <- Matrix::colSums(counts_mat) >= 500
+  SCTransform(dat[, sufficient_UMIs])
+})
+
+# Remove doublets
+mats <- lapply(mats, function(dat) {
+  # First run PCA
+  dat <- RunPCA(dat)
+
+  # DoubletFinder pK identification (when no ground-truth)
+  sweep.res.list <- paramSweep(dat, PCs = 1:10, sct = TRUE)
+  sweep.stats <- summarizeSweep(sweep.res.list, GT = FALSE)
+  bcmvn <- find.pK(sweep.stats)
+  pK <- as.numeric(as.character(bcmvn[order(bcmvn$BCmetric, decreasing=T),]$pK[1]))
+
+  # Estimated expected number of doublets (e.g. <3% with Parse WTv2)
+  nExp <- round(0.03 * ncol(dat))
+
+  # Run DoubletFinder
+  dat <- doubletFinder(dat, PCs = 1:10, pN = 0.25, pK = pK, nExp = nExp, reuse.pANN = NULL, sct = TRUE)
+
+  # Remove doublets
+  df_col <- grep("DF.classifications", colnames(dat@meta.data), value = TRUE)
+  colnames(dat@meta.data)[colnames(dat@meta.data) == df_col] <- "doublet_class"
+  singlets <- subset(dat, subset = doublet_class == "Singlet")
+  doublets <- subset(dat, subset = doublet_class != "Singlet")
+  return(list(singlets = singlets, doublets = doublets, bcmvn = bcmvn))
+})
+```
+
+From the singlets matrices we identify genes and barcodes common to both (i.e. jitter = 0 and jitter = 2), and return each matrix subset by these intersects. The returned matrices are then re-normalised, subject to PCA, neighbour identification, clustering, and a UMAP plot generated. Finally, we compute the adjusted Rand index using the jitter = 0 cluster memberships as a reference for the jitter = 2 cluster memberships.
+
+```R
+# Extract singlets lists
+singlets <- lapply(mats, function(x) x$singlets)
+
+# Identify common genes and barcodes between singlet count matrices
+mat.a <- singlets[[1]]
+mat.b <- singlets[[2]]
+barcodes <- colnames(mat.a)[which(colnames(mat.a) %in% colnames(mat.b))]
+genes <- rownames(mat.a)[which(rownames(mat.a) %in% rownames(mat.b))]
+mat.b <- mat.b[genes, barcodes] # matrix B
+singlets <- list(mat.a[genes, barcodes], mat.b[genes, barcodes])
+
+# Normalize and cluster
+mats_clustering <- lapply(singlets, function(dat){
+  set.seed(123)  # For reproducibility
+  dat <- SCTransform(dat)
+  dat <- RunPCA(dat)
+  dat <- FindNeighbors(dat, dims = 1:10, k.param = 20)
+  dat <- FindClusters(dat, resolution = 0.1)
+  dat <- RunUMAP(dat, dims = 1:10)
+})
+p1 <- DimPlot(mats_clustering[[1]], reduction = "umap") + scale_color_jco()
+p2 <- DimPlot(mats_clustering[[2]], reduction = "umap") + scale_color_jco()
+ggarrange(p1, p2, labels=c("A", "B")) %>%
+  ggsave(width = 12, height = 6, units="in", dpi=300, bg = "white",
+         filename = paste0("plots/", names(raw)[1], "-", names(raw)[length(raw)], "_umap.png"))
+
+# Calculated adjusted Rand index
+adjustedRandIndex(factor(mats_clustering[[2]]@meta.data$seurat_clusters),
+  factor(mats_clustering[[1]]@meta.data$seurat_clusters))
+```
