@@ -630,3 +630,8 @@ ggarrange(p1, p2, labels=c("A", "B")) %>%
 adjustedRandIndex(factor(mats_clustering[[2]]@meta.data$seurat_clusters),
   factor(mats_clustering[[1]]@meta.data$seurat_clusters))
 ```
+
+
+The Parse UMAP figure should resemble the following:
+
+<img src="./img/Parse-WTv2-J0-Parse-WTv2-J2_umap.png" alt="Parse jitter 0 versus jitter 2 UMAP"/>
