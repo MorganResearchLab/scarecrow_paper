@@ -1,6 +1,6 @@
 # scarecrow
 
-This repo outlines code and analysis presented in the [scarecrow](https://github.com/MorganResearchLab/scarecrow) paper. BASH scripts mentioned in this doc are provided in the repo at `scarecrow/src/HPC`.
+This repo outlines code and analysis presented in the [scarecrow](https://github.com/MorganResearchLab/scarecrow) paper. BASH scripts mentioned in this doc are provided in the repo at `scarecrow/src/HPC`. For convenience, the `transcripts_to_genes.txt` file is provided at `scarecrow/data`.
 
 ## Data processing
 ##### BASH
