@@ -1,6 +1,6 @@
 # scarecrow
 
-This repo outlines code and analysis presented in the [scarecrow](https://github.com/MorganResearchLab/scarecrow) paper.
+This repo outlines code and analysis presented in the [scarecrow](https://github.com/MorganResearchLab/scarecrow) paper. BASH scripts mentioned in this doc are provided in [scarecrow](https://github.com/MorganResearchLab/scarecrow/src/HPC).
 
 ## Data processing
 ##### BASH
