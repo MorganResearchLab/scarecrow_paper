@@ -1,29 +1,39 @@
 # scarecrow
 
-This repo contains R code used in the analysis presented in the [scarecrow](https://github.com/MorganResearchLab/scarecrow) paper. Several of the QC steps are borrowed from the Pachter lab kallisto [tutorial](https://pachterlab.github.io/kallistobustools/tutorials/kb_building_atlas/R/kb_analysis_0_R/).
+This repo outlines code and analysis presented in the [scarecrow](https://github.com/MorganResearchLab/scarecrow) paper.
 
-## Libraries and functions
+## Data processing
+##### BASH
+
+We analysed Parse Evercode (WTv2) (SRA accession: SRR28867557) and Scale Biosciences QuantumnScale (SRA accession: SRR28867558) data. Once downloaded, the data was processed using the default set-based method of barcode matching with `scarecrow`. Details are provided in the `scarecrow` docs for processing the [Evercode](https://github.com/MorganResearchLab/scarecrow/blob/main/docs/example_evercode.md) and [QuantumnScale](https://github.com/MorganResearchLab/scarecrow/blob/main/docs/example_scale.md) data from downloading through to count matrix generation. The Evercode data was processed to allow upto 2 mismatches, for jitter values of 0, 1, and 2. The QuantumnScale data was processed to allow upto 2 mismatches, for jitter values of 0 and 1.
+
+
+## Process Kallisto count matrices
+##### R
+
+The below code block imports the required libraries, adds a couple of functions, imports the gene-transcript table, sets constant parameters and imports the kallisto count matrices for a given dataset into a list. The list is then processed to generate raw metrics plots, outputting matrix dimensions (features x cells) and total UMIs (for Table S2) in the process. The resulting plots (e.g. Figure S2) are then written to file.
 
 ```R
-library(Seurat)
-library(Matrix)
+# Data wrangling functions
+library(dplyr)
 library(tidyverse)
-library(patchwork)
-library(ggpubr)
-library(ggdist)
+library(SingleCellExperiment)
+library(mgcv)                    # this is required for the big additive model (BAM) (e.g. middle panel in Figure S8)
+
+# Functions involved in plotting
+library(ggplot2)
 library(ggpointdensity)
+library(ggdensity)
+library(ggdist)
+library(ggpubr)
+library(ggsci)
 library(viridis)
 library(scales)
-library(ggpmisc)
-library(DoubletFinder)
-library(glmGamPoi)
-library(ggsci)
-library(mclust)
 
-# Slightly modified from BUSpaRse, just to avoid installing a few dependencies not used here
+# Function to read Kallisto count matrices
 read_count_output <- function(dir, name) {
   dir <- normalizePath(dir, mustWork = TRUE)
-  m <- readMM(paste0(dir, "/", name, ".mtx"))
+  m <- Matrix::readMM(paste0(dir, "/", name, ".mtx"))
   m <- Matrix::t(m)
   m <- as(m, "CsparseMatrix")
   # The matrix read has cells in rows
@@ -37,10 +47,13 @@ read_count_output <- function(dir, name) {
 
 # Returns a tibble with total UMI counts for each barcode, and
 # rank of the total counts, with number 1 for the barcode with the most counts.
+# https://pachterlab.github.io/kallistobustools/tutorials/kb_building_atlas/R/kb_analysis_0_R
 get_knee_df <- function(mat) {
   total <- rank <- NULL
-  tibble(total = Matrix::colSums(mat),
-         rank = row_number(desc(total))) %>%
+  tibble(
+    total = Matrix::colSums(mat),
+    rank = dplyr::row_number(dplyr::desc(total))
+  ) %>%
     distinct() %>%
     dplyr::filter(total > 0) %>%
     arrange(rank)
@@ -48,68 +61,29 @@ get_knee_df <- function(mat) {
 
 # Minimum total UMI counts for barcode for it to be considered when calculating the inflection point;
 # this helps to avoid the noisy part of the curve for barcodes with very few counts.
+# https://pachterlab.github.io/kallistobustools/tutorials/kb_building_atlas/R/kb_analysis_0_R
 get_inflection <- function(df, lower = 100) {
-  log_total <- log_rank <- total <-  NULL
+  log_total <- log_rank <- total <- NULL
   df_fit <- df %>%
     dplyr::filter(total >= lower) %>%
-    transmute(log_total = log10(total),
-              log_rank = log10(rank))
-  d1n <- diff(df_fit$log_total)/diff(df_fit$log_rank)
+    transmute(
+      log_total = log10(total),
+      log_rank = log10(rank)
+    )
+  d1n <- diff(df_fit$log_total) / diff(df_fit$log_rank)
   right.edge <- which.min(d1n)
   10^(df_fit$log_total[right.edge])
 }
 
-# Plot a transposed knee plot, showing the inflection point and
-# the number of remaining cells after inflection point filtering. It's
-# transposed since it's more generalizable to multi-modal data. Taken from the
-# BUSpaRse package.
-knee_plot <- function(df, inflection, fontsize=10) {
-  total <- rank_cutoff <- NULL
-  annot <- tibble(inflection = inflection, rank_cutoff = max(df$rank[df$total > inflection]))
-  ggplot(df, aes(total, rank)) + geom_path() +
-    geom_vline(aes(xintercept = inflection), data = annot, linetype = 2, color = "gray40") +
-    geom_hline(aes(yintercept = rank_cutoff), data = annot, linetype = 2, color = "gray40") +
-    geom_text(aes(inflection, rank_cutoff, label = paste(rank_cutoff, "'cells'")), data = annot, vjust = 1, size=3) +
-    scale_x_log10(labels = label_comma()) + scale_y_log10(labels = label_comma()) +
-    labs(y = "Rank", x = "Total UMIs") +
-    annotation_logticks() & theme_bw() &
-    theme(text = element_text(size=fontsize))
-}
+# Constants
+setwd("~/Documents/scarecrow/examples") # folder that contains data
+fontsize <- 10                          # font size on plots
+nmads <- 3                              # number of median absolute deviations for mtDNA filter
+minFeatures <- 1                        # min number of features (genes) per cell
+minUMIs <- 100                          # min number of UMIs per cell
 
-# Plot PCT genes
-plot_pct_genes <- function(mat, tr2g, top_n = 20, symbol = "ensembl", fontsize=10) {
-  pct_tx <- rowSums(mat)
-  gs <- rownames(mat)[order(-pct_tx)]
-  df <- as.data.frame(t(mat[gs[1:top_n],]))
-  df <- df %>%
-    mutate_all(function(x) x/colSums(mat)) %>%
-    pivot_longer(everything(), names_to = "gene")
-  if (symbol == "ensembl") {
-    df <- left_join(df, tr2g, by = "gene")
-  } else {
-    df <- rename(df, gene_name = gene)
-  }
-  df %>%
-    mutate(gene = fct_reorder(gene_name, value, .fun = median)) %>%
-    ggplot(aes(gene, value)) +
-    geom_boxplot() +
-    labs(x = "", y = "Proportion of total counts") +
-    coord_flip() +
-    theme_bw() + theme(text = element_text(size=fontsize))
-}
-
-# Contants
-fontsize <- 8
-setwd("~/Documents/scarecrow/results")
-```
-
-## Import transcript to gene table
-
-This is taken from the `kallisto` genome indices.
-
-```R
-# Load gene to transcript data
-tr2g <- read_tsv("~/Documents/scarecrow_test/results/transcripts_to_genes.txt", col_names = c("transcript", "gene", "gene_name"))
+# Import gene to transcript table
+tr2g <- readr::read_tsv("transcripts_to_genes.txt", col_names = c("transcript", "gene", "gene_name"))
 tr2g <- distinct(tr2g[, c("gene", "gene_name")])
 tr2g[is.na(tr2g$gene_name),]$gene_name <- tr2g[is.na(tr2g$gene_name),]$gene
 # uniquify the duplicates (some ensembl gene IDs map to the same gene symbol)
@@ -117,58 +91,70 @@ gene_name_dups <- tr2g$gene_name[which(duplicated(tr2g$gene_name))]
 for(n in gene_name_dups) {
   tr2g[which(tr2g$gene_name == n),]$gene_name <- paste(tr2g[which(tr2g$gene_name == n),]$gene_name, tr2g[which(tr2g$gene_name == n),]$gene, sep="-")
 }
-```
 
-### Import kallisto counts matrices
+# Note below, only one dataset is imported for processing at a time, either Parse or Scale. The associated files are imported into a the list 'raw'.
 
-After generating count matrices for each dataset with `kallisto` under different `scarecrow` jitter settings, the `counts_unfiltered/cells*` are read into a list and named.
+# Parse Evercode Kallisto count matrices
+raw <- list(read_count_output("./Parse/kallisto/J0M2/SRR28867558_1_trimmed/counts_unfiltered", name = "cells_x_genes"),
+            read_count_output("./Parse/kallisto/J1M2/SRR28867558_1_trimmed/counts_unfiltered", name = "cells_x_genes"),
+            read_count_output("./Parse/kallisto/J2M2/SRR28867558_1_trimmed/counts_unfiltered", name = "cells_x_genes"))
+names(raw) <- c("Parse-J0", "Parse-J1", "Parse-J2")
 
-```R
-raw <- list(read_count_output("~/Documents/scarecrow/results/Parse-WTv2/J0/kallisto/counts_unfiltered", name = "cells_x_genes"),
-            read_count_output("~/Documents/scarecrow/results/Parse-WTv2/J1/kallisto/counts_unfiltered", name = "cells_x_genes"),
-            read_count_output("~/Documents/scarecrow/results/Parse-WTv2/J2/kallisto/counts_unfiltered", name = "cells_x_genes"))
-names(raw) <- c("Parse-WTv2-J0", "Parse-WTv2-J1", "Parse-WTv2-J2")
-```
+# Scale QuantumnScale Kallisto count matrices
+raw <- list(read_count_output("./Scale/kallisto/J0M2/SRR28867557_1_trimmed/counts_unfiltered", name = "cells_x_genes"),
+            read_count_output("./Scale/kallisto/J1M2/SRR28867557_1_trimmed/counts_unfiltered", name = "cells_x_genes"))
+names(raw) <- c("Scale-J0", "Scale-J1")
 
-## Processing count matrices
+# Process count matrix
+mats <- lapply(raw, function(res_mat) {
 
-After importing the data, we apply a series of steps to the list of count matrices. These steps are based on the `kallisto` tutorial linked at the start of the page. Briefly, we (1) test of library saturation; (2) generate a knee plot to identify the inflection point in barcode count; (3) filter each count matrix based on its inflection point and return a `Seurat` object; (4) plot mtDNA fraction and RNA counts;  (5) filter data to retain cells whose mtDNA content is below the 99th percentile. The filtering applied here is very rudimentary.
+  cat(".... pre-filter dimensions\n")
+  print(dim(res_mat))
+  cat(".... UMI count\n")
+  print(sum(res_mat))
 
-```R
-# Test for library saturation
-libsat <- lapply(raw, function(res_mat) {
-  tot_counts <- colSums(res_mat)
-  lib_sat <- tibble(nCount = tot_counts, nGene = colSums(res_mat > 0))
-
-  p1 <- ggplot(lib_sat, aes(nCount, nGene)) +
+  # Generate plot to check for library saturation
+  tot_counts <- Matrix::colSums(res_mat)
+  lib_sat <- tidyr::tibble(nCount = tot_counts, nGene = Matrix::colSums(res_mat > 0))
+  Fig1A <- ggplot(lib_sat, aes(nCount, nGene)) +
     geom_pointdensity(size=1, adjust=2) + scale_color_viridis(name="density\n(neighbours)", labels = label_comma()) +
     scale_x_log10(labels = label_comma()) + scale_y_log10(labels = label_comma()) + annotation_logticks() +
-    xlab("Number of molecules") + ylab("Number of features") +
+    xlab("Number of UMIs") + ylab("Number of features") +
     theme_bw() + theme(text = element_text(size=fontsize), legend.position = "right")
-  return(list(p1 = p1))
-})
 
-# Knee plot for inflection point in barcode count
-knees <- lapply(raw, function(res_mat) {
+  # Generate plot to check for inflection point in barcode/UMI count
   knee_df <- get_knee_df(res_mat)
   inflection <- get_inflection(knee_df, lower=100)
-  return(list(inflection = inflection, knee_plot = knee_plot(knee_df, inflection, fontsize=fontsize)))
-})
 
-# Filter and return Seurat Object
-mats <- lapply(1:length(raw), function(i) {
-  res_mat <- raw[[i]][, colSums(raw[[i]]) > knees[[i]]$inflection]
-  res_mat <- res_mat[Matrix::rowSums(res_mat) > 0,]
-  tmp <- rownames(res_mat)
-  rownames(res_mat) <- tr2g$gene_name[match(rownames(res_mat), tr2g$gene)]
-  rownames(res_mat)[which(is.na(rownames(res_mat)))] <- tmp[which(is.na(rownames(res_mat)))]
-  CreateSeuratObject(counts = res_mat, project = names(raw)[i], min.cells = 1, min.features = 1)
-})
+  # Knee plot
+  total <- rank_cutoff <- NULL
+  annot <- tibble(inflection = inflection, rank_cutoff = max(knee_df$rank[knee_df$total > inflection]))
+  Fig1B <- ggplot(knee_df, aes(total, rank)) +
+    geom_path() +
+    geom_vline(aes(xintercept = inflection), data = annot, linetype = 2, color = "gray40") +
+    geom_hline(aes(yintercept = rank_cutoff), data = annot, linetype = 2, color = "gray40") +
+    geom_text(aes(inflection, rank_cutoff, label = paste(rank_cutoff, "'cells'")), data = annot, vjust = 1, size = 3) +
+    scale_x_log10(labels = label_comma()) +
+    scale_y_log10(labels = label_comma()) +
+    labs(y = "Rank", x = "Total UMIs") +
+    annotation_logticks() + theme_bw() +
+    theme(text = element_text(size = fontsize))
 
-# Plot mt percent and nCount_RNAs
-mt_pct <- lapply(mats, function(dat) {
-  dat[["percent.mt"]] <- PercentageFeatureSet(dat, pattern = "^MT-")
-  p1a <- ggplot(data.frame(X=dat$nFeature_RNA), aes(y=X, slab_color = after_stat(y))) +
+  # Filter and return SingleCellExperiment object
+  cat("Filtering and outputting SingleCellExperiment (SCE) object\n")
+  res <- SingleCellExperiment(assays = list(counts = res_mat[, Matrix::colSums(res_mat) > inflection]))
+
+  # Annotate mitochondrial genes
+  mt_genes <- tr2g[grep("^MT-", tr2g$gene_name),]$gene
+  res <- scuttle::addPerCellQC(res, subsets=list(Mito=mt_genes[which(mt_genes %in% rownames(res))]))
+  qc.percent.mt <- NULL
+  if(max(res$subsets_Mito_percent) > 0) {
+    cat(".... %MT > 0, running scater::isOutlier for:", nmads,"median absolute deviations\n")
+    qc.percent.mt <- scater::isOutlier(res$subsets_Mito_percent, nmads = nmads, type="higher")
+  }
+
+  # Plot: Features per cell
+  Fig1Ca <- ggplot(data.frame(X=res$detected), aes(y=X, slab_color = after_stat(y))) +
     stat_slabinterval(side = "right", lty=0) +
     stat_dotsinterval(slab_shape = 19, quantiles =100, side="left") +
     scale_color_distiller(aesthetics = "slab_color", guide = "colorbar2") +
@@ -179,7 +165,8 @@ mt_pct <- lapply(mats, function(dat) {
                        legend.position = "None") + coord_flip() +
     theme(plot.margin = margin(l = 0.75, r = 0.5, unit = "cm"))
 
-  p1b <- ggplot(data.frame(X=dat$nCount_RNA), aes(y=X, slab_color = after_stat(y))) +
+  # Plot: Molecules per cell
+  Fig1Cb <- ggplot(data.frame(X=res$sum), aes(y=X, slab_color = after_stat(y))) +
     stat_slabinterval(side = "right", lty=0) +
     stat_dotsinterval(slab_shape = 19, quantiles =100, side="left") +
     scale_color_distiller(aesthetics = "slab_color", guide = "colorbar2") +
@@ -189,7 +176,9 @@ mt_pct <- lapply(mats, function(dat) {
                        axis.text.y = element_blank(), axis.title.y = element_blank(),
                        legend.position = "None") + coord_flip() +
     theme(plot.margin = margin(l = 0.75, r = 0.5, unit = "cm"))
-  p1c <- ggplot(data.frame(X=dat$percent.mt), aes(y=X, slab_color = after_stat(y))) +
+
+  # % mitochondrial genes per cell
+  Fig1Cc <- ggplot(data.frame(X=res$subsets_Mito_percent), aes(y=X, slab_color = after_stat(y))) +
     stat_slabinterval(side = "right", lty=0) +
     stat_dotsinterval(slab_shape = 19, quantiles =100, side="left") +
     scale_color_distiller(aesthetics = "slab_color", guide = "colorbar2") +
@@ -198,66 +187,63 @@ mt_pct <- lapply(mats, function(dat) {
                        axis.text.y = element_blank(), axis.title.y = element_blank(),
                        legend.position = "None") + coord_flip() +
     theme(plot.margin = margin(l = 0.75, r = 0.5, unit = "cm"))
-  p1 <- ggarrange(p1a,p1b,p1c,nrow=3)
+  Fig1C <- ggarrange(Fig1Ca, Fig1Cb, Fig1Cc, nrow=3)
+  rm(Fig1Ca, Fig1Cb, Fig1Cc)
 
-  p2 <- ggplot(data.frame(X=dat$nCount_RNA, Y=dat$percent.mt), aes(x=X, y=Y)) +
+  # % mitochondrial genes per cell x molecules per cell
+  Fig1D <- ggplot(data.frame(X=res$sum, Y=res$subsets_Mito_percent), aes(x=X, y=Y)) +
     geom_pointdensity(size=1, adjust=5) + scale_color_viridis(name="density\n(neighbours)", labels = label_comma()) +
     xlab("Molecules per cell") + ylab("% mitochondrial genes") +
     scale_x_continuous(labels = label_comma()) +
-    geom_hline(yintercept=quantile(dat$percent.mt,.99), lty=2) +
-    annotate("text", x=max(dat$nCount_RNA)/2, y=quantile(dat$percent.mt,.99), hjust=0, vjust=-1, size=3, label = "99th percentile") +
+    geom_hline(yintercept=min(res$subsets_Mito_percent[which(qc.percent.mt==T)]), lty=2) +
+    annotate("text", x=max(res$sum)/2, y=min(res$subsets_Mito_percent[which(qc.percent.mt==T)]),
+             hjust=0, vjust=-1, size=3, label = paste0("MADS > ", nmads)) +
     theme_bw() + theme(text = element_text(size=fontsize), legend.position = "right")
 
-  p3 <- ggplot(data.frame(X=dat$nCount_RNA, Y=dat$nFeature_RNA), aes(x=X, y=Y)) +
-    geom_pointdensity(size=1, adjust=5) + scale_color_viridis(name="density\n(neighbours)", labels = label_comma()) +
-    xlab("Molecules per cell") + ylab("Features per cell") +
-    scale_x_continuous(labels = label_comma()) + scale_y_continuous(labels = label_comma()) +
-    geom_hline(yintercept=quantile(dat$nFeature_RNA,.99), lty=2) +
-    geom_vline(xintercept=quantile(dat$nCount_RNA,.99), lty=2) +
-    annotate("text", x=max(dat$nCount_RNA)/2, y=quantile(dat$nFeature_RNA,.99), hjust=0, vjust=-1, size=3, label = "99th percentile") +
-    theme_bw() + theme(text = element_text(size=fontsize), legend.position = "None")
+  # Figure 1
+  Fig1 <- ggarrange(ggarrange(Fig1A, Fig1B, widths=c(4,4), labels=c("A", "B"), nrow=1),
+                    ggarrange(Fig1C, Fig1D, widths=c(3,5), labels=c("C", "D"), nrow=1),nrow=2)
+  rm(Fig1A, Fig1B, Fig1C, Fig1D)
 
-  return(list(p1 = p1, p2 = p2, p3 = p3))
+  # Filter data
+  cat(".... pre-MT filter dimensions\n")
+  print(dim(res))
+
+  if(max(res$subsets_Mito_percent) > 0) {
+    cat(".... %MT > 0, running scater::isOutlier for:", nmads,"median absolute deviations\n")
+    res <- res[, which(!scater::isOutlier(res$subsets_Mito_percent, nmads = nmads, type="higher"))]
+  }
+  cat("\t..identifying cells with sufficient UMI count:", minUMIs, "\n")
+  sufficient_UMIs <- Matrix::colSums(counts(res)) >= minUMIs
+  cat("\t..identifying cells with sufficient feature count:", minFeatures, "\n")
+  sufficient_Features <- Matrix::rowSums(counts(res)) >= minFeatures
+  res <- res[which(sufficient_Features), which(sufficient_UMIs)]
+
+  cat(".... post filter dimensions\n")
+  print(dim(res))
+
+  return(list(mat = res, plot = Fig1))
+
 })
+names(mats) <- names(raw)
 
-# Apply filter and normalize
-mats_filtered <- lapply(mats, function(dat) {
-  dat[["percent.mt"]] <- PercentageFeatureSet(dat, pattern = "^MT-")
-  dat <- subset(dat, subset = percent.mt < quantile(dat$percent.mt,.99))
-  # Remove genes with zero total counts
-  counts_mat <- GetAssayData(dat, slot = "counts")
-  nonzero_genes <- Matrix::rowSums(counts_mat) > 0
-  dat <- dat[nonzero_genes, ]
-  # Normalize the filtered object
-  dat <- NormalizeData(dat, normalization.method = "LogNormalize", scale.factor = 10000)
-  return(dat)
+# Save mats as these will be used for analysis later
+save(mats, file=paste0(gsub("-.*", "", names(raw)[1]), ".RData"))
+
+# Output plots to file (e.g. Figure S2)
+cat("Outputting metrics plots\n")
+lapply(1:length(mats), function(i) {
+  ggsave(mats[[i]]$plot, width = 8, height = 6, units="in", dpi=300, filename = paste0("raw_metrics_", names(mats)[i], ".png"))
 })
 ```
 
-### Plotting the processing results
-
-We generate multi-panel plots to illustrate some of the results from the above steps as follows.
+The below code block processes the list of matrices `mats` to return the median genes/cell, median UMIs/cell, and max UMIs/gene (for Table S3). The row- and column-wise values are then used to generate plots comparing mean and max gene counts with and without jitter (e.g. Figure S6).
 
 ```R
-for(i in 1:length(raw)){
-  ggarrange(ggarrange(libsat[[i]]$p1, knees[[i]]$knee_plot, widths=c(4,4), labels=c("A", "B"), nrow=1),
-            ggarrange(mt_pct[[i]]$p1, mt_pct[[i]]$p2, widths=c(3,5), labels=c("C", "D"), nrow=1),
-            nrow=2) %>%
-    ggsave(width = 8, height = 6, units="in", dpi=300, filename = paste0("plots/", names(raw)[i], "_kallisto.png"))
-}
-```
-
-Below is an example, showing the plot generated from the Parse data at jitter 2.
-
-<img src="./img/Parse-WTv2-J2_kallisto.png" alt="Parse jitter 2 processing results"/>
-
-Panel A shows a library saturation plot, with points coloured according to the density of neighbouring points. Note that there is a high density of points with a single feature and molecule, these correspond to near empty droplets. Panel B shows a knee plot, indicating the inflection point for cells that have at least 100 UMIs, the total number of which is indicated on the plot. Panel C shows raindcloud plots to illustrate the distributions of the number of features per cell, the number of molecules per cell, and the percentage of mitochondrial (mt) genes per cell. These distributions are calcualted after filtering to retain cells with UMI counts exceeding the inflection point. Panel D presents a density scatter plot of UMI count against mt gene content for features, with the 99th percentile of mt gene content indicated with a dashed line.
-
-Next we compare the mean and median counts per gene between two sets of results. In the below code we compare the first list element to the last, which for the Parse data results is comparing jitter 0 to jitter 2.
-
-```R
-# Median genes per cell
-genes_per_cell.median <- lapply(1:length(mats_filtered), function(i) median(Matrix::colSums(mats_filtered[[i]]@assays$RNA$counts != 0)))
+# Median genes/cell (Table S3)
+genes_per_cell.median <- lapply(1:length(mats), function(i) median(Matrix::colSums(counts(mats[[i]]$mat)>0)))
+# Median umis/cell (Table S3)
+umis_per_cell.median <- lapply(1:length(mats), function(i) median(Matrix::colSums(counts(mats[[i]]$mat))))
 
 # Calculate row-wise and col-wise stats of dgCMatrix
 sparse_stats_dgCMatrix <- function(dgCMatrix) {
@@ -328,15 +314,15 @@ sparse_stats_dgCMatrix <- function(dgCMatrix) {
 
   return(list(row_stats = row_stats, col_stats = col_stats))
 }
+mat_stats <-  lapply(1:length(mats), function(i) sparse_stats_dgCMatrix(counts(mats[[i]]$mat)))
+# Max UMIs/gene (Table S3)
+umis_per_cell.max <- lapply(1:length(mats), function(i) max(mat_stats[[i]]$row_stats$max))
 
-# Generate matrix stats for each filtered counts matrix
-mat_stats <-  lapply(1:length(mats_filtered), function(i) sparse_stats_dgCMatrix(mats_filtered[[i]]@assays$RNA$counts))
-
-# Merge stats from two matrices for plotting
+# Generate plots of mean and max counts per gene with and without jitter (e.g. Figure S6)
 tmp <- merge(mat_stats[[1]]$row_stats, mat_stats[[length(mat_stats)]]$row_stats, by="gene")
 p1 <- ggplot(tmp, aes(x=log(mean.x), y=log(mean.y))) + geom_pointdensity(size=1, adjust=0.5) +
   scale_color_viridis(name="Density\n(neighbours)", labels = label_comma()) +
-  xlab("Jitter 0 mean count per gene (log10)") + ylab(paste0("Jitter ", length(mat_stats)-1, " mean count per gene (log10)")) +
+  xlab("Jitter 0 mean count per gene (log10)") + ylab(paste0("Jitter ", length(raw)-1, " mean count per gene (log10)")) +
   geom_abline(colour="red", lty=2) +
   annotate("label", x = Inf, y = Inf, hjust = 1.1, vjust = 1.1, fill = "white", alpha = 0.7, size = 3,
            label = paste("Above abline:", sum(tmp$mean.y > tmp$mean.x, na.rm=T),
@@ -344,7 +330,7 @@ p1 <- ggplot(tmp, aes(x=log(mean.x), y=log(mean.y))) + geom_pointdensity(size=1,
   theme_bw() + theme(text = element_text(size=fontsize), legend.position = "right")
 p2 <- ggplot(tmp, aes(x=log(max.x), y=log(max.y))) + geom_pointdensity(size=1, adjust=0.5) +
   scale_color_viridis(name="Density\n(neighbours)", labels = label_comma()) +
-  xlab("Jitter 0 max count per gene (log10)") + ylab(paste0("Jitter ", length(mat_stats)-1, " max count per gene (log10)")) +
+  xlab("Jitter 0 max count per gene (log10)") + ylab(paste0("Jitter ", length(raw)-1, " max count per gene (log10)")) +
   geom_abline(colour="red", lty=2) +
   annotate("label", x = Inf, y = Inf, hjust = 1.1, vjust = 1.1, fill = "white", alpha = 0.7, size = 3,
            label = paste("Above abline:", sum(tmp$max.y > tmp$max.x, na.rm=T),
@@ -353,28 +339,27 @@ p2 <- ggplot(tmp, aes(x=log(max.x), y=log(max.y))) + geom_pointdensity(size=1, a
 
 ggarrange(p1,p2, labels=c("A", "B"), nrow=2, common.legend = T, legend = "right") %>%
   ggsave(width = 4, height = 6, units="in", dpi=300, bg = "white",
-         filename = paste0("plots/", names(raw)[1], "-", names(raw)[length(mat_stats)], "_counts.png"))
+         filename = paste0(names(mats)[1], "-", names(mats)[length(mats)], "_counts.png"))
 ```
 
-This returns the following image:
+## Evaluating jitter-dependent read-barcode re-assignment
+##### R
 
-<img src="./img/Parse-WTv2-J0-Parse-WTv2-J2_counts.png" alt="Parse jitter 0 versus jitter 2 gene counts"/>
-
-
-## Barcode count gains
-
-The `combined_CB_counts.txt` file output by `scarecrow stats` can be analysed to plot barcode count gains under different jitter settings. In the below example we import the Parse jitter 0 and jitter 2 data.
+First we compare the difference in UMI count per unique barcode combination reported by `scarecrow stats` for data processed with and without jitter. Here we process the Scale and Parse datasets independently, comparing jitter 0 to 1 and 0 to 2, respectively. The counts from each jitter are merged on unique barcode and plotted (e.g. Figure S8).
 
 ```R
-library(mgcv)
+# Parse datasets for jitter = 0 and jitter = 2
+file_a <- read.table("./Parse/extracted/J0M2/SRR28867558_1_trimmed.fastq.combined_CB_counts.txt")
+file_b <- read.table("./Parse/extracted/J2M2/SRR28867558_1_trimmed.fastq.combined_CB_counts.txt")
 
-file_a <- read.table("~/Documents/scarecrow_test/results/Parse-WTv2/J0/SRR28867558_1_trimmed.fastq.combined_CB_counts.txt")
-file_b <- read.table("~/Documents/scarecrow_test/results/Parse-WTv2/J2/SRR28867558_1_trimmed.fastq.combined_CB_counts.txt")
+# Scale datasets for jitter = 0 and jitter = 1
+file_a <- read.table("./Scale/extracted/J0M2/SRR28867557_1_trimmed.fastq.combined_CB_counts.txt")
+file_b <- read.table("./Scale/extracted/J1M2/SRR28867557_1_trimmed.fastq.combined_CB_counts.txt")
 
-dataset <- "Parse"
-jitter <- c(0,2) # set labels for jitter values of data
+dataset <- "Parse" # or "Scale"
+jitter <- c(0,2)   # Set labels for jitter values of data, e.g. Scale is c(0,1), Parse is c(0,2)
 
-dat <- merge(file_a, file_b, by="V1", all=T)
+dat <- merge(file_a, file_b, by="V1", all=T) # Merge data on barcode combination
 dat[is.na(dat)] <- 0
 dat$diff <- dat$V2.y-dat$V2.x
 dat$set <- "Intersect"
@@ -388,7 +373,7 @@ p1 <- ggplot(dat[which(dat$set==paste0("J", jitter[1])),], aes(x=log10(V2.x), y=
   scale_x_continuous(labels = label_comma()) + scale_y_continuous(labels = label_comma()) +
   theme_bw() + theme(text = element_text(size=fontsize), legend.position = "bottom")
 
-# BAM (big additive model)
+# bam (big additive model)
 fit <- bam(diff ~ V2.x + s(V2.x, bs = "tp"), data = dat[which(dat$set=="Intersect"),])
 p2 <- ggplot(dat[which(dat$set=="Intersect"),], aes(x=log10(V2.x), y=diff)) +
   geom_line(colour="red", lty=2, alpha=0.8) + geom_point(size=1, alpha=0.5) +
@@ -407,113 +392,175 @@ p3 <- ggplot(dat[which(dat$set==paste0("J", jitter[2])),], aes(x=log10(V2.y), y=
   theme_bw() + theme(text = element_text(size=fontsize), legend.position = "bottom")
 
 ggarrange(p1,p2,p3, nrow=1, common.legend=F, widths=c(1,3,1)) %>%
-  ggsave(width = 12, height = 6, units="in", dpi=300, filename = paste0("plots/", dataset, "_", jitter[1], "-", jitter[2], "_UMIs.png"))
+  ggsave(width = 12, height = 6, units="in", dpi=300, filename = paste0(dataset, "_", jitter[1], "-", jitter[2], "_UMIs.png"))
 ```
 
-This results in the following plot:
+## Evaluating jitter-dependent read-barcode re-assignment
+##### BASH
 
-<img src="./img/Parse_0-2_UMIs.png" alt="Parse jitter 0 versus jitter 2 barcode gains"/>
+First, we extract read name and SAM tags (CB, XP, XM) from BAM the files to compare.
 
-The plots show log10 UMI counts on the x axis and the difference in UMI count (jitter 2 - jitter 1) for the same barcode on the y axis. The left panel shows barcodes identified only at jitter 0, the middle panel shows barcodes identified in both datasets, and the right panel shows barcodes identified only at jitter 2. The negative difference in UMI counts in the intersect implies the re-assignment of reads to different barcodes at jitter 2 relative to jitter 0.
+```bash
+mamba activate samtools_env
 
+PROJECT=./scarecrow/examples/Scale
+sbatch -p uoa-compute --ntasks 1 --cpus-per-task 8 --mem 4G --time=12:00:00 \
+    ./scarecrow/scripts/samtags.sh --sam ${PROJECT}/extracted/J0M2/SRR28867557_1_trimmed.sam
+sbatch -p uoa-compute --ntasks 1 --cpus-per-task 8 --mem 4G --time=12:00:00 \
+    ./scarecrow/scripts/samtags.sh --sam ${PROJECT}/extracted/J1M2/SRR28867557_1_trimmed.sam
 
-## k-Nearest neighbours
-
-Starting, for example, from the Parse raw data for jitter 0 and 2, we apply basic filtering to retain cells and features with at least 100 counts each. We then subset the two matrices to retain cells with shared barcodes between both sets of data.
-
-```R
-raw <- list(read_count_output("~/Documents/scarecrow/results/Parse-WTv2/J0/kallisto/counts_unfiltered", name = "cells_x_genes"),
-            read_count_output("~/Documents/scarecrow/results/Parse-WTv2/J2/kallisto/counts_unfiltered", name = "cells_x_genes"))
-names(raw) <- c("Parse-WTv2-J0", "Parse-WTv2-J2")
-
-mats <- lapply(1:length(raw), function(i) {
-  res_mat <- raw[[i]][, colSums(raw[[i]]) > 99]
-  res_mat <- res_mat[Matrix::rowSums(res_mat) > 99,]
-})
-
-barcodes <- colnames(mats[[1]])[colnames(mats[[1]]) %in% colnames(mats[[2]])]
-genes <- rownames(mats[[1]])[rownames(mats[[1]]) %in% rownames(mats[[2]])]
-mats[[1]] <- mats[[1]][genes, barcodes]
-mats[[2]] <- mats[[2]][genes, barcodes]
+PROJECT=./scarecrow/examples/Parse
+sbatch -p uoa-compute --ntasks 1 --cpus-per-task 8 --mem 4G --time=12:00:00 \
+    ./scarecrow/scripts/samtags.sh --sam ${PROJECT}/extracted/J0M2/SRR28867558_1_trimmed.sam
+sbatch -p uoa-compute --ntasks 1 --cpus-per-task 8 --mem 4G --time=12:00:00 \
+    ./scarecrow/scripts/samtags.sh --sam ${PROJECT}/extracted/J2M2/SRR28867558_1_trimmed.sam
 ```
 
-We use the `FNN` library's `get.knn` function to identify the nearest neighbours for a range of *k* values (2:10, 20, 30, 50) for each matrix.
+Next, we sample n barcodes from the BAM[1] read tags, retrieve read names, and subset these reads from the BAM[2] read tags. The result is that we now have for the same subset of reads, the read tags recorded from each BAM file.
 
-```R
-knn_results <- lapply(c(2:10,20,30,50), function(k) lapply(mats, function(m) FNN::get.knn(as.matrix(t(m)), k = k)) )
+```bash
+PROJECT=./scarecrow/examples/Scale
+sbatch -p uoa-compute ./scarecrow/scripts/read_reassignment.sh \
+    --a ${PROJECT}/extracted/J0M2/SRR28867557_1_trimmed.sam.tags \
+    --b ${PROJECT}/extracted/J1M2/SRR28867557_1_trimmed.sam.tags \
+    --n 10000
+
+PROJECT=./scarecrow/examples/Parse
+sbatch -p uoa-compute ./scarecrow/scripts/read_reassignment.sh \
+    --a ${PROJECT}/extracted/J0M2/SRR28867558_1_trimmed.sam.tags \
+    --b ${PROJECT}/extracted/J2M2/SRR28867558_1_trimmed.sam.tags \
+    --n 10000
 ```
 
-This can take a while, so you may wish to save the object afterward so that it can just reloaded in the future without having to re-run the analysis.
+The resulting files should have a format as follows:
 
-```R
-save(knn_results, file="Parse_knn_results.RData")
-load("Parse_knn_results.RData")
+```bash
+SRR28867557.20120	CB:Z:TCCGGCTTAT_TCAGCGGTT_TTATCCGGAT	XP:Z:1_1_24	XM:Z:0_0_0
+SRR28867557.20159	CB:Z:TCCGGCTTAT_GACTGACGT_AACCTGCGTA	XP:Z:1_1_24	XM:Z:0_0_0
+SRR28867557.20165	CB:Z:TCCGGCTTAT_TTCGCGGAT_ACTTGCTAGA	XP:Z:1_1_24	XM:Z:0_0_0
 ```
 
-After calculating kNN for each matrix, we can calculate the proportion of shared and identical neighbours identified across both datasets for each cell.
+
+## Evaluating jitter-dependent read-barcode re-assignment
+##### R
+
+After generating the above SAM tag TSV files for a subset of reads, each dataset is analysed in R independently. The values from these analyses populate Table S4.
 
 ```R
+# Scale datasets for jitter = 0 and jitter = 1
+file_a <- read.table("./Scale/extracted/J0M2/SRR28867557_1_trimmed.sam.tags.subset_10000.tsv")
+file_b <- read.table("./Scale/extracted/J1M2/SRR28867557_1_trimmed.sam.tags.subset_10000.tsv")
+
+# Parse datasets for jitter = 0 and jitter = 2
+file_a <- read.table("./Parse/extracted/J0M2/SRR28867558_1_trimmed.sam.tags.subset_10000.tsv")
+file_b <- read.table("./Parse/extracted/J2M2/SRR28867558_1_trimmed.sam.tags.subset_10000.tsv")
+
+dat <- merge(file_a, file_b, all=T, by="V1") # merge reads on read name
+# Extract barcode index positions and mismatch counts
+a <- do.call("rbind", lapply(dat$V3.x, function(i) as.numeric(unlist(strsplit(unlist(strsplit(i, "XP:Z:"))[2], "_")))))
+b <- do.call("rbind", lapply(dat$V4.x, function(i) as.numeric(unlist(strsplit(unlist(strsplit(i, "XM:Z:"))[2], "_")))))
+c <- do.call("rbind", lapply(dat$V3.y, function(i) as.numeric(unlist(strsplit(unlist(strsplit(i, "XP:Z:"))[2], "_")))))
+d <- do.call("rbind", lapply(dat$V4.y, function(i) as.numeric(unlist(strsplit(unlist(strsplit(i, "XM:Z:"))[2], "_")))))
+barcode_Xvals <- cbind(a, b, c, d)
+colnames(barcode_Xvals) <- c(paste("XP", seq(1,ncol(barcode_Xvals)/4), ".x", sep=""),
+                             paste("XM", seq(1, ncol(barcode_Xvals)/4), ".x", sep=""),
+                             paste("XP", seq(1, ncol(barcode_Xvals)/4), ".y", sep=""),
+                             paste("XM", seq(1, ncol(barcode_Xvals)/4), ".y", sep=""))
+dat <- cbind(dat, barcode_Xvals)
+dat$mismatches.x <- rowSums(dat[, grep("XM[0-9].x", colnames(dat))])
+dat$mismatches.y <- rowSums(dat[, grep("XM[0-9].y", colnames(dat))])
+
+# Barcode counts
+length(unique(file_a$V2)) # Unique barcodes at jitter = 0 (should be the sampled amount, i.e. 10k)
+length(unique(file_b$V2)) # Unique barcodes at jitter > 0
+
+# Barcode re-assignments (FALSE = Different, TRUE = Identical, N/A = N/A)
+table(dat$V2.x == dat$V2.y, useNA = "ifany") # counts
+(table(dat$V2.x == dat$V2.y, useNA = "ifany") / sum(table(dat$V2.x == dat$V2.y, useNA = "ifany") ))*100 # as percentage
+
+# Count of perfect barcode matches at j > 0 where barcode is different at j0
+reassigned <- data.frame(perfect = nrow(dat[which(dat$V2.x != dat$V2.y & dat$mismatches.y == 0),]),
+                         imperfect = nrow(dat[which(dat$V2.x != dat$V2.y & dat$mismatches.y > 0),]))
+reassigned / sum(reassigned) # counts as percentage
+
+# Mean mismatches
+mean(dat$XM1.x) # Mean mismatches for BC1 at jitter = 0
+mean(dat$XM2.x) # Mean mismatches for BC2 at jitter = 0
+mean(dat$XM3.x) # Mean mismatches for BC3 at jitter = 0
+mean(dat$XM1.y, na.rm=T) # Mean mismatches for BC1 at jitter != 0
+mean(dat$XM2.y, na.rm=T) # Mean mismatches for BC2 at jitter != 0
+mean(dat$XM3.y, na.rm=T) # Mean mismatches for BC3 at jitter != 0
+```
+
+
+## Checking the impact of jitter on kNN clustering
+##### BASH
+
+The RData saved for each matrix above is passed to an R script to undertake kNN analysis for a range of k values. The script filters the first and last matrix to retain cells and genes with > 99 counts, and then reduces each matrix to their common cells and genes. The reduced matrices are then processed using a fast nearest-neighbour searching algorithm to record nearest neighbours for a range of k values (2:10, 20, 30, 50). The results are saved as an RData file for downstream analysis.
+
+```bash
+sbatch --partition uoa-compute ./scarecrow/scripts/kNN.sh --in ./scarecrow/examples/Parse/Parse.RData # 2720536
+sbatch --partition uoa-compute ./scarecrow/scripts/kNN.sh --in ./scarecrow/examples/Scale/Scale.RData # 2720530
+```
+
+##### R
+
+The resulting RData processed in R as follows to generate plots (e.g. Figure S10).
+
+```R
+# Load kNN RData created in previous setp
+load("./Scale_knn.RData")
+
+# Calculate kNN shared neighbour proportions
 knn_props <- lapply(1:length(knn_results), function(k) {
   knn_shared <- do.call("rbind", lapply(1:nrow(knn_results[[k]][[1]]$nn.index), function(i) {
-      sum(knn_results[[k]][[1]]$nn.index[i,] %in% knn_results[[k]][[2]]$nn.index[i,])
-    } ))
+    sum(knn_results[[k]][[1]]$nn.index[i,] %in% knn_results[[k]][[2]]$nn.index[i,])
+  } ))
   knn_identical <- do.call("rbind", lapply(1:nrow(knn_results[[k]][[1]]$nn.index), function(i) {
-      sum(knn_results[[k]][[1]]$nn.index[i,] == knn_results[[k]][[2]]$nn.index[i,])
-    } ))
+    sum(knn_results[[k]][[1]]$nn.index[i,] == knn_results[[k]][[2]]$nn.index[i,])
+  } ))
   return(data.frame(k = dim(knn_results[[k]][[1]]$nn.index)[2],
                     shared = knn_shared/dim(knn_results[[k]][[1]]$nn.index)[2],
                     identical = knn_identical/dim(knn_results[[k]][[1]]$nn.index)[2]))
 })
 knn_props <- do.call("rbind", knn_props)
-```
-
-Next we collapse the data into a format that can be more easily plotted with ggplot. We add a small amount of noise to the k value so that the points do not stack in thin vertical lines. We also allocate separate facets for values at k > 10, to avoid large gaps on the x axis or using a discontinuous scale.
-
-```R
 knn_props_long <- rbind(
   data.frame(k = knn_props$k, value = knn_props$shared, group = "shared"),
   data.frame(k = knn_props$k, value = knn_props$identical, group = "identical")
 )
 
-set.seed(123)
+# HDR plot
+set.seed(123)  # For reproducibility
 knn_props_long$x <- knn_props_long$k + runif(nrow(knn_props_long), -0.00000001, 0.00000001)
 knn_props_long$facet <- 1
 knn_props_long[which(knn_props_long$k>10),]$facet <- knn_props_long[which(knn_props_long$k>10),]$k
-```
-
-Using this data we generate a list of high density region (HDR) plots for each facet. After which, we move the y axis text, ticks, and labels from all but the first plot.
-
-```R
 plots <- lapply(unique(knn_props_long$facet), function(f) {
   ggplot(knn_props_long[which(knn_props_long$group=="shared" & knn_props_long$facet == f),], aes(x = x, y = value)) +
     geom_hdr(aes(fill=after_stat(probs)), alpha=1) +
     scale_x_continuous(breaks = seq(1:50)) + ylim(0,1) +
-    ylab("Proportion shared") + xlab("k Nearest-Neighbours") +
+    ylab("Proportion shared") + xlab("k-Nearest neighbours") +
     theme_bw() + theme(text = element_text(size = fontsize), legend.position = "top",
                        plot.margin = margin(l = 0.75, r = 0, unit = "cm"),
                        axis.text.x = element_text(size=6),
                        axis.text.y = element_text(size=6))
 })
-
+# Remove y-axis elements for all but the first
 plots[-1] <- lapply(plots[-1], function(p) {
   p + xlab("") + theme(axis.title.y = element_blank(), axis.text.y = element_blank(),
-            axis.ticks.y = element_blank(),
-            plot.margin = margin(l = 0, r = 0, unit = "cm"))
+                       axis.ticks.y = element_blank(),
+                       plot.margin = margin(l = 0, r = 0, unit = "cm"))
 })
-```
 
-Next, we generate quantile bar plots for each k value. Note, this is a single plot faceted by k value.
-
-```R
+# Quantile bar plot
 qdat <- knn_props %>% group_by(k) %>%
   summarise(
     q25 = quantile(shared, 0.25),
-    q50 = quantile(shared, 0.5),
+    q50 = quantile(shared, 0.5),  # median
     q75 = quantile(shared, 0.75),
     q100 = quantile(shared, 1.00)
   ) %>%
   pivot_longer(
-    cols = starts_with("q"),
+    cols = starts_with("q"),         # or just: -group
     names_to = "quantile",
     values_to = "value"
   )
@@ -525,135 +572,142 @@ p2 <- ggplot(qdat, aes(x=quantile, y=value, fill="a")) + geom_col(position="dodg
                      axis.text.x = element_text(angle=90, hjust=1, vjust=0.5, size=6),
                      axis.text.y = element_text(size=6),
                      legend.position="none")
-```
 
-Finally, the HDR and bar plots are output as a multi-panel figure.
-
-```R
+# Combine plots
 ggarrange(ggarrange(plotlist=plots, nrow=1, widths=c(1.5,0.1,0.1,0.1), common.legend=T),
-          p2, nrow=2, heights = c(2,1)) %>%
-  ggsave(width = 5, height = 4, units="in", dpi=300, bg = "white",
-         filename = paste0("plots/", names(raw)[1], "-", names(raw)[length(raw)], "_kNN.png"))
-```
+          p2, nrow=2, heights = c(2,1))
 
-Resulting in the following:
-
-<img src="./img/Parse_0-2_kNN.png" alt="Parse jitter 0 versus jitter 2 nearest-neighbours"/>
-
-The mean proportion of shared neighbours for each k value can be reported as follows:
-
-```R
 # Mean proportion shared neighbours by k value
 knn_props_long %>% filter(group=="shared") %>% group_by(k) %>% summarize(mean(value))
 ```
 
-## Cluster membership
 
-Example using the Parse raw data for jitter 0 and 2. We apply an initial filter to retain cells with at least 100 UMIs, and remove genes with zero counts. Next we remove cells expressing >1% mitochondrial genes and any with fewer than 500 UMIs. These steps could be reduced into one, but it is sometimes helpful to monitor the impact of different filters on the data. Following this filtering, the data is normalised by SCTransform. Next we label doublets identified by DoubletFinder assuming a 3% double rate. The returned object is now a list containing: singlets, doublets, and the data.frame returned by the find.pK function of DoubletFinder.
+## Exploring the impact of jitter on a typical scRNA-seq workflow
+##### R
+
+To explore any possible impact on the application of jitter on barcode matching by processing the data in a typical workflow. We start by loading the RData saved after processing the Kallisto count matrices. This data is further processed by log-normalising the counts, idenentifying the top 10% of highly variable genes, running PCA and clustering followed by doublet-removal.
 
 ```R
-j = 3 # For the Parse data, we have jitter = [0,1,2] in the raw list, so want to compare elements 1 and 3
-mats <- lapply(c(1,j), function(i) {
-  res_mat <- raw[[i]][, colSums(raw[[i]]) > knees[[i]]$inflection]
-  res_mat <- res_mat[Matrix::rowSums(res_mat) > 0,]
-  tmp <- rownames(res_mat)
-  rownames(res_mat) <- tr2g$gene_name[match(rownames(res_mat), tr2g$gene)]
-  rownames(res_mat)[which(is.na(rownames(res_mat)))] <- tmp[which(is.na(rownames(res_mat)))]
-  CreateSeuratObject(counts = res_mat, project = names(raw)[i], min.cells = 1, min.features = 1)
-})
+dataset <- "Parse"
+load(paste0(dataset, ".RData"))
 
-# Filter count matrix on mt < 99%, retain nonzero genes and cells with UMIs >= 500, return SCTransofrm normalized matrix
-mats <- lapply(mats, function(dat) {
-  dat[["percent.mt"]] <- PercentageFeatureSet(dat, pattern = "^MT-")
-  dat <- subset(dat, subset = percent.mt < quantile(dat$percent.mt,.99))
-  counts_mat <- GetAssayData(dat, slot = "counts")
-  sufficient_UMIs <- Matrix::colSums(counts_mat) >= 500
-  SCTransform(dat[, sufficient_UMIs])
-})
 
 # Remove doublets
-mats <- lapply(mats, function(dat) {
-  # First run PCA
-  dat <- RunPCA(dat)
+mats_clean <- lapply(mats, function(dat) {
+  set.seed(seed)
 
-  # DoubletFinder pK identification (when no ground-truth)
-  sweep.res.list <- paramSweep(dat, PCs = 1:10, sct = TRUE)
-  sweep.stats <- summarizeSweep(sweep.res.list, GT = FALSE)
-  bcmvn <- find.pK(sweep.stats)
-  pK <- as.numeric(as.character(bcmvn[order(bcmvn$BCmetric, decreasing=T),]$pK[1]))
+  # UMI filter
+  sufficient_UMIs <- Matrix::colSums(counts(dat$mat)) >= 500
+  dat$mat <- dat$mat[, which(sufficient_UMIs)]
 
-  # Estimated expected number of doublets (e.g. <3% with Parse WTv2)
-  nExp <- round(0.03 * ncol(dat))
+  # Log normalisation
+  cat("\t..log-normalising counts data\n")
+  dat <- scuttle::logNormCounts(dat$mat)
 
-  # Run DoubletFinder
-  dat <- doubletFinder(dat, PCs = 1:10, pN = 0.25, pK = pK, nExp = nExp, reuse.pANN = NULL, sct = TRUE)
+  # Feature selection
+  cat("\t..identifying HVGs\n")
+  dec <- scran::modelGeneVar(dat)
+  hvg <- scran::getTopHVGs(dec, prop=0.1)
 
-  # Remove doublets
-  df_col <- grep("DF.classifications", colnames(dat@meta.data), value = TRUE)
-  colnames(dat@meta.data)[colnames(dat@meta.data) == df_col] <- "doublet_class"
-  singlets <- subset(dat, subset = doublet_class == "Singlet")
-  doublets <- subset(dat, subset = doublet_class != "Singlet")
-  return(list(singlets = singlets, doublets = doublets, bcmvn = bcmvn))
+  # PCA
+  cat("\t..running PCA\n")
+  dat <- scater::runPCA(dat)
+
+  # Clustering
+  cat("\t..clustering cells based on PCA using Louvain function\n")
+  colLabels(dat) <- scran::clusterCells(dat, use.dimred='PCA', BLUSPARAM=bluster::NNGraphParam(cluster.fun="louvain"))
+
+  # Doublets: Simulation-based (doublet densities)
+  cat("\t..computing doublet densiies (scDblFinder)\n")
+  set.seed(seed)
+  dbl.dens <- scDblFinder::computeDoubletDensity(dat, subset.row=hvg, d=ncol(reducedDim(dat)))
+  dat$DoubletScore <- dbl.dens
+  dbl.calls <- scDblFinder::doubletThresholding(data.frame(score=dbl.dens), method="griffiths", returnType="call", perSample = FALSE)
+  summary(dbl.calls)
+
+  # Doublets: Simulation-based (classification)
+  cat("\t..combining doublet density with iterative classification scheme (scDblFinder)\n")
+  set.seed(seed)
+  dat.dbl <- scDblFinder::scDblFinder(dat, clusters=colLabels(dat), nfeatures = hvg)
+  summary(dat.dbl$scDblFinder.class)
+
+  # Union of doublets
+  dbl.union <- unique(c(which(dbl.calls=="doublet"), which(dat.dbl$scDblFinder.class=="doublet")))
+  cat("\t..UNION of doublet finding methods accounts for", signif(length(dbl.union) / dim(dat)[2], 3)*100, "% of data\n")
+
+  # Return doublet-filtered data
+  return(dat[,-dbl.union])
 })
-```
-
-From the singlets matrices we identify genes and barcodes common to both (i.e. jitter = 0 and jitter = 2), and return each matrix subset by these intersects. The returned matrices are then re-normalised, subject to PCA, neighbour identification, clustering, and a UMAP plot generated. Finally, we compute the adjusted Rand index using the jitter = 0 cluster memberships as a reference for the jitter = 2 cluster memberships.
-
-```R
-# Extract singlets lists
-singlets <- lapply(mats, function(x) x$singlets)
 
 # Identify common genes and barcodes between singlet count matrices
-mat.a <- singlets[[1]]
-mat.b <- singlets[[2]]
+mat.a <- mats_clean[[1]]
+mat.b <- mats_clean[[length(mats)]] # length(mats) = 2 for Scale; length(mats) = 3 for Parse
 barcodes <- colnames(mat.a)[which(colnames(mat.a) %in% colnames(mat.b))]
 genes <- rownames(mat.a)[which(rownames(mat.a) %in% rownames(mat.b))]
-mat.b <- mat.b[genes, barcodes] # matrix B
 singlets <- list(mat.a[genes, barcodes], mat.b[genes, barcodes])
 
-# Normalize and cluster
-mats_clustering <- lapply(singlets, function(dat){
-  set.seed(123)  # For reproducibility
-  dat <- SCTransform(dat)
-  dat <- RunPCA(dat)
-  dat <- FindNeighbors(dat, dims = 1:10, k.param = 20)
-  dat <- FindClusters(dat, resolution = 0.1)
-  dat <- RunUMAP(dat, dims = 1:10)
+# Normalise and cluster
+mats_proc <- lapply(singlets, function(dat) {
+  set.seed(seed)
+
+  # Log normalisation
+  cat("\t..log-normalising counts data\n")
+  dat <- scuttle::logNormCounts(dat)
+
+  # PCA
+  cat("\t..running PCA\n")
+  dat <- scater::runPCA(dat)
+
+  # Clustering
+  cat("\t..clustering cells based on PCA using Louvain function\n")
+  colLabels(dat) <- scran::clusterCells(dat, use.dimred='PCA', BLUSPARAM=bluster::NNGraphParam(cluster.fun="louvain"))
+
+  # Build neighbor graph
+  cat("\t..building nearest-neighbour graph\n")
+  g <- scran::buildSNNGraph(dat, use.dimred = "PCA", k = 50)
+
+  # Clustering (Louvain; resolution controlled via cluster parameter)
+  cat("\t..clustering\n")
+  clusters <- igraph::cluster_louvain(g)$membership
+  dat$cluster <- factor(clusters)
+
+  # UMAP
+  cat("\t..running UMAP\n")
+  dat <- scater::runUMAP(dat, dimred = "PCA")
+
+  return(dat)
 })
-p1 <- DimPlot(mats_clustering[[1]], reduction = "umap") + scale_color_jco()
-p2 <- DimPlot(mats_clustering[[2]], reduction = "umap") + scale_color_jco()
+
+# Plot UMAPs
+p1 <- scater::plotReducedDim(mats_proc[[1]], "UMAP", colour_by = "cluster") + scale_color_jco(name="cluster")
+p2 <- scater::plotReducedDim(mats_proc[[2]], "UMAP", colour_by = "cluster") + scale_color_jco(name="cluster")
 ggarrange(p1, p2, labels=c("A", "B")) %>%
   ggsave(width = 12, height = 6, units="in", dpi=300, bg = "white",
-         filename = paste0("plots/", names(raw)[1], "-", names(raw)[length(raw)], "_umap.png"))
+    filename = paste0(dataset, "_umap.png"))
+
+# Compute adjusted Rand index between the two clustering results
+adjRand <- mclust::adjustedRandIndex(factor(mats_proc[[2]]$cluster), factor(mats_proc[[1]]$cluster))
 ```
 
-The Parse UMAP figure should resemble the following:
 
-<img src="./img/Parse-WTv2-J0-Parse-WTv2-J2_umap.png" alt="Parse jitter 0 versus jitter 2 UMAP"/>
+## Main paper figure
+##### R
 
-
-We compare cluster membership by computing the adjusted Rand index between the jitter 0 and jitter 2 clusters. In addition, we can generate a heat map of cluster assignments as follows:
+The plots on the main figure in the paper were generated based on the Scale data. The UMAP (Fig 1C) generation and adjusted Rand index values are reported from the previous code block. The data underpinning the bar plots (Fig 1B) is available from the supplementary tables (Table S1, Table S2, Table S3). The heatmap of cluster memberships was generated as follows:
 
 ```R
-# Calculated adjusted Rand index
-adjRand <- adjustedRandIndex(factor(mats_clustering[[2]]@meta.data$seurat_clusters),
-  factor(mats_clustering[[1]]@meta.data$seurat_clusters))
-
 # Generate cluster table for plotting heatmap
-clusters <- as.data.frame(table(Jitter0 = mats_clustering[[1]]@meta.data$seurat_clusters,
-                                Jitter1 = mats_clustering[[2]]@meta.data$seurat_clusters))
+clusters <- as.data.frame(table(Jitter0 = colData(mats_proc[[1]])$cluster,
+                                Jitter1 = colData(mats_proc[[2]])$cluster))
 # Normalize
 clusters <- clusters %>% group_by(Jitter0) %>% mutate(Prop = Freq / sum(Freq)) %>% ungroup()
 
 # Plot heatmap
 ggplot(clusters, aes(x = Jitter1, y = Jitter0, fill = Prop)) +
-    geom_tile(color = "white") +
-    scale_fill_gradient(low = "#DDDDFF", high = "steelblue")+
-    geom_text(aes(label = Freq), size = 2) +  # show actual counts
-    labs(x = "Jitter 2 cluster assignments", y = "Jitter 0 cluster assignments", fill = "Proportion") +
-    theme_bw() + theme(text = element_text(size=8))
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "#DDDDFF", high = "steelblue")+
+  geom_text(aes(label = Freq), size = 2) +  # show actual counts
+  labs(x = "Jitter 1 cluster assignments", y = "Jitter 0 cluster assignments", fill = "Proportion") +
+  labs(subtitle=paste0("Adjusted Rand index: ", signif(adjRand, 2))) +
+  theme_bw() + theme(text = element_text(size=8), plot.subtitle = element_text(size=7))
 ```
-
-Which returns the following figure:
-
-<img src="./img/Parse-WTv2-J0-Parse-WTv2-J2_hmap.png" alt="Parse jitter 0 versus jitter 2 cluster membership heatmap"/>
